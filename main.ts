@@ -506,7 +506,7 @@ function searchBlocks(lines: string[]): Block[] | number {
         break;
       }
     }
-    // the `=======` and `>>>>>>> REPLACE` lines
+    // the `=======` and `>>>>>>> REPLACE` lines after it: SPEC.md only asks that a pair exist
     let div = -1;
     let rep = -1;
     for (let k = i + 1; k < lines.length; k += 1) {
