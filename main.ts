@@ -250,32 +250,38 @@ function checked(p: string): string {
 interface SectionState {
   cur: Section | null;
   hunk: Hunk | null;
-  /** The kind of the last body line read, so a `\` line can be tied to the line before it. */
-  last: 'ctx' | 'old' | 'new' | null;
-  /** A `\` line followed the last `+` line read: that line has no break. */
-  plusNoEol: boolean;
+  /** The kind of each body line read so far: a `\` line refers to the one before it. */
+  kinds: Array<'ctx' | 'empty' | 'old' | 'new' | 'bs'>;
 }
 
 /** The sections of a unified patch, or the 1-based patch line that cannot be read (SPEC.md section 6). */
 function unifiedSections(lines: string[]): Section[] | number {
   const sections: Section[] = [];
-  const st: SectionState = { cur: null, hunk: null, last: null, plusNoEol: false };
+  const st: SectionState = { cur: null, hunk: null, kinds: [] };
   const newHeader = (): Header => ({ old: null, new: null, oldNull: false, newNull: false, create: false, del: false, touched: false, pathsSet: false });
   const closeHunk = (): void => {
     const hunk = st.hunk;
     if (hunk !== null && st.cur !== null) {
       // empty lines at the end of a body are not part of it
-      while (hunk.o.length > 0 && hunk.n.length > 0) {
-        const lo = hunk.o[hunk.o.length - 1]!;
-        const ln = hunk.n[hunk.n.length - 1]!;
-        if (lo === '' && ln.ctx !== undefined && ln.text === '') {
-          hunk.o.pop();
-          hunk.n.pop();
-        } else break;
+      while (st.kinds.length > 0 && st.kinds[st.kinds.length - 1] === 'empty') {
+        hunk.o.pop();
+        hunk.n.pop();
+        st.kinds.pop();
       }
+      // a `\` line after the hunk's last context or `+` line drops the final break
+      let last = -1;
+      for (let k = st.kinds.length - 1; k >= 0; k -= 1) {
+        const kind = st.kinds[k];
+        if (kind === 'ctx' || kind === 'empty' || kind === 'new') {
+          last = k;
+          break;
+        }
+      }
+      hunk.noEol = last >= 0 && st.kinds[last + 1] === 'bs';
       st.cur.hunks.push(hunk);
     }
     st.hunk = null;
+    st.kinds = [];
   };
   let i = 0;
   while (i < lines.length) {
@@ -304,7 +310,10 @@ function unifiedSections(lines: string[]): Section[] | number {
       h.touched = true;
       h.pathsSet = true;
       if (st.cur !== null && !st.cur.header.pathsSet && st.cur.hunks.length === 0) {
-        // a `---`/`+++` pair inside a section's header: it names this section's paths
+        // a `---`/`+++` pair inside a section's header: it names this section's paths, and
+        // the `new file mode`/`deleted file mode` lines already read still say what it does
+        h.create = h.create || st.cur.header.create;
+        h.del = h.del || st.cur.header.del;
         st.cur.header = h;
       } else {
         const sec: Section = { header: h, hunks: [] };
@@ -316,13 +325,14 @@ function unifiedSections(lines: string[]): Section[] | number {
     }
     if (st.cur !== null && st.cur.hunks.length === 0 && st.hunk === null) {
       const h = st.cur.header;
-      if (l.startsWith('rename from ')) {
+      // a `rename` pair names the paths only when no `---`/`+++` pair does
+      if (l.startsWith('rename from ') && !h.pathsSet) {
         h.old = l.slice(12);
         h.touched = true;
         i += 1;
         continue;
       }
-      if (l.startsWith('rename to ')) {
+      if (l.startsWith('rename to ') && !h.pathsSet) {
         h.new = l.slice(10);
         h.touched = true;
         i += 1;
@@ -348,41 +358,40 @@ function unifiedSections(lines: string[]): Section[] | number {
       if (st.cur === null) return i + 1; // a hunk before any section
       closeHunk();
       st.hunk = { a: Number(m[1]), o: [], n: [], noEol: false };
-      st.last = null;
-      st.plusNoEol = false;
+      st.kinds = [];
       i += 1;
       continue;
     }
     if (st.hunk !== null) {
       const hunk = st.hunk;
-      if (l.startsWith(' ') || l === '') {
+      if (l.startsWith(' ')) {
         hunk.o.push(l.slice(1));
         hunk.n.push({ text: l.slice(1), ctx: hunk.o.length - 1 });
-        st.last = 'ctx';
-        st.plusNoEol = false;
+        st.kinds.push('ctx');
+        i += 1;
+        continue;
+      }
+      if (l === '') {
+        hunk.o.push('');
+        hunk.n.push({ text: '', ctx: hunk.o.length - 1 });
+        st.kinds.push('empty');
         i += 1;
         continue;
       }
       if (l.startsWith('-')) {
         hunk.o.push(l.slice(1));
-        st.last = 'old';
-        st.plusNoEol = false;
+        st.kinds.push('old');
         i += 1;
         continue;
       }
       if (l.startsWith('+')) {
         hunk.n.push({ text: l.slice(1) });
-        st.last = 'new';
-        st.plusNoEol = false;
+        st.kinds.push('new');
         i += 1;
         continue;
       }
       if (l.startsWith('\\')) {
-        // refers to the body line before it; only a context or `+` line takes the final break with it
-        if (st.last === 'ctx' || st.last === 'new') {
-          hunk.noEol = true;
-          if (st.last === 'new') st.plusNoEol = true;
-        }
+        st.kinds.push('bs'); // refers to the body line before it
         i += 1;
         continue;
       }
@@ -551,11 +560,11 @@ function blockEdit(b: Block): Edit {
   };
 }
 
-/** The blocks as edits; the path named by a block is checked for safety before anything else. */
+/** The blocks as edits: a block with no path at all is a parse fault; an unsafe path is an edit's failure. */
 function searchEdits(lines: string[]): Block[] | number {
   const blocks = searchBlocks(lines);
   if (typeof blocks === 'number') return blocks;
-  for (const b of blocks) if (b.path === null || !safe(b.path)) return b.searchLine;
+  for (const b of blocks) if (b.path === null) return b.searchLine;
   return blocks;
 }
 
@@ -664,7 +673,7 @@ function fillSection(sec: V4aSection, body: Array<{ text: string; at: number }>)
       lastWasPlus = false;
       continue;
     }
-    if (t.trim() === '*** End of File') {
+    if (t === '*** End of File') {
       if (chunk === null) return item.at;
       chunk.atEnd = true;
       push();
