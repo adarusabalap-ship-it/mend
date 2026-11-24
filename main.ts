@@ -204,6 +204,8 @@ interface Hunk {
   n: PL[];
   /** A `\` line followed the hunk's last context or `+` line: no final break. */
   noEol: boolean;
+  /** A `\` line followed the hunk's last `+` line (a creation reads only these). */
+  noEolPlus: boolean;
 }
 
 /** One unified section: its header, its hunks and the patch line each part came from. */
@@ -278,6 +280,15 @@ function unifiedSections(lines: string[]): Section[] | number {
         }
       }
       hunk.noEol = last >= 0 && st.kinds[last + 1] === 'bs';
+      // a creation reads only the `+` lines, so only a `\` after the last of them counts
+      let lastPlus = -1;
+      for (let k = st.kinds.length - 1; k >= 0; k -= 1) {
+        if (st.kinds[k] === 'new') {
+          lastPlus = k;
+          break;
+        }
+      }
+      hunk.noEolPlus = lastPlus >= 0 && st.kinds[lastPlus + 1] === 'bs';
       st.cur.hunks.push(hunk);
     }
     st.hunk = null;
@@ -357,7 +368,7 @@ function unifiedSections(lines: string[]): Section[] | number {
       if (m === null) return i + 1;
       if (st.cur === null) return i + 1; // a hunk before any section
       closeHunk();
-      st.hunk = { a: Number(m[1]), o: [], n: [], noEol: false };
+      st.hunk = { a: Number(m[1]), o: [], n: [], noEol: false, noEolPlus: false };
       st.kinds = [];
       i += 1;
       continue;
@@ -414,7 +425,9 @@ function createdLines(sec: Section): { lines: string[]; noEol: boolean } {
         noEol = false;
       }
     }
-    if (hunk.noEol && hunk.n.length > 0 && hunk.n[hunk.n.length - 1]!.ctx === undefined) noEol = true;
+    // SPEC.md section 6: a created file ends with a break unless a `\` line follows
+    // its last `+` line - context lines do not enter into it.
+    if (hunk.noEolPlus) noEol = true;
   }
   return { lines: out, noEol };
 }
